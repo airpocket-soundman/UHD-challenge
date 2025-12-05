@@ -1,0 +1,74 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+*.log
+
+# モデルファイル（大容量ファイル）
+*.onnx
+*.pt
+*.pth
+*.bin
+*.pb
+models/
+!models/.gitkeep
+
+# ESP-DL変換出力
+model_conversion/out/
+model_conversion/uhd_*_out/
+model_conversion/*_s3/
+model_conversion/*.bin
+model_conversion/*.c
+model_conversion/*.onnx
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.cache/
+*.pyc
+
+# ESP-IDF
+sdkconfig
+sdkconfig.old
+build/
+
+# テスト・一時ファイル
+*.tmp
+*.temp
+test_output/
+scratch/

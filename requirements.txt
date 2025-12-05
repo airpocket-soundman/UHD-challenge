@@ -1,0 +1,17 @@
+# UHD-challenge Python依存関係
+# Python 3.10+ 推奨
+
+# ESP-DL変換ツール
+esp-dlc>=1.0.0
+
+# ONNX最適化・検証
+onnxsim>=0.4.35
+onnx>=1.15.0
+
+# 推論・検証用
+onnxruntime>=1.14.0
+
+# オプション: 開発・デバッグ用
+# numpy>=1.24.0
+# opencv-python>=4.8.0  # カメラテスト用
+# pillow>=10.0.0        # 画像処理用
