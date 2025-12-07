@@ -55,6 +55,12 @@ model_conversion/*.bin
 model_conversion/*.c
 model_conversion/*.onnx
 
+# ESP-DL変換後の大きなファイル（実行に不要）
+*.info
+*.espdl
+model_conversion/transrated_models/
+model_conversion/esp_dl/
+
 # ESP-PPQ（一時的なクローン）
 model_conversion/esp-ppq-temp/
 
