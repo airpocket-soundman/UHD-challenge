@@ -1,0 +1,80 @@
+feat: Phase 1完了 - ESP-IDF UHD Detection プロジェクト基盤構築
+
+## 概要
+M5Stack CoreS3上でリアルタイム物体検出を実現するESP-IDFプロジェクトの
+基盤構築を完了。ESP-DLフレームワークを使用したUltratinyODモデルの
+実行環境を構築。
+
+## 主な変更内容
+
+### プロジェクト構造
+- ESP-IDF v5.5.1プロジェクトの初期構造を作成
+- CMakeビルドシステムの設定
+- カスタムパーティションテーブルの定義
+  - factory: 3MB (アプリケーション)
+  - storage: 12MB (データストレージ)
+
+### 依存ライブラリ統合
+- espressif/esp-dl: ^3.2.1 (AI推論エンジン)
+- espressif/esp32-camera: ^2.1.4 (カメラドライバ)
+- espressif/esp-dsp: ^1.7.0 (デジタル信号処理)
+- espressif/dl_fft: ^0.3.1 (FFT演算)
+- espressif/esp_jpeg: ^1.3.1 (JPEG処理)
+- espressif/esp_new_jpeg: ^0.6.1 (最適化JPEG処理)
+
+### ハードウェア設定
+- M5Stack CoreS3のピン配置定義
+  - カメラ(OV2640): DVPインターフェース
+  - microSD: SPI接続
+  - LCD(ST7789): 内蔵
+- PSRAM無効化による安定動作確認
+
+### ドキュメント整備
+- README.md: プロジェクト概要とセットアップ手順
+- SPECIFICATIONS.md: 詳細な技術仕様書
+  - ハードウェア/ソフトウェア仕様
+  - AI推論仕様（入出力、演算子）
+  - パフォーマンス目標
+  - 処理フロー詳細
+  - 開発フェーズ計画
+
+### 動作確認
+- ビルド成功 (~200KB)
+- フラッシュ書き込み成功
+- ESP32-S3正常起動確認
+- シリアルモニター動作確認
+
+## 技術詳細
+
+### メモリ使用量
+- SRAM: ~50KB / 512KB
+- Flash: ~200KB / 16MB
+- PSRAM: 無効化（Phase 2で有効化予定）
+
+### ビルド環境
+- ESP-IDF: v5.5.1
+- CMake: 3.16+
+- C++: C++17
+- ターゲット: ESP32-S3
+
+## 次のステップ (Phase 2)
+- カメラ統合 (OV2640)
+- QVGA(320×240)画像取得
+- 30FPS達成
+
+## テスト結果
+✅ ビルド成功
+✅ フラッシュ成功
+✅ 起動成功
+✅ 安定動作確認（カウンターテスト）
+
+## 影響範囲
+- 新規プロジェクト作成（既存コードへの影響なし）
+- ESP_IDF_Core3/ディレクトリ全体
+
+## 関連Issue
+- Phase 1: 基盤構築完了
+
+---
+
+Signed-off-by: Your Name <your.email@example.com>

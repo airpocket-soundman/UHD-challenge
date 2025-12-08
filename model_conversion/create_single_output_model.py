@@ -108,12 +108,27 @@ Next steps:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create single-output model for ESP-DL conversion"
+        description="Create single-output model for ESP-DL conversion (ReLU version)",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example usage:
+  # ReLU version w64 (recommended)
+  python model_conversion\\create_single_output_model.py \\
+    --input model_conversion\\w_ESE+IoU-aware+ReLU\\ultratinyod_res_anc8_w64_64x64_quality_relu_nopost.onnx \\
+    --output model_conversion\\onnx\\uhd_relu_w64_single.onnx \\
+    --constants model_conversion\\onnx\\uhd_relu_constants.npz
+
+  # ReLU version w96
+  python model_conversion\\create_single_output_model.py \\
+    --input model_conversion\\w_ESE+IoU-aware+ReLU\\ultratinyod_res_anc8_w96_64x64_quality_relu_nopost.onnx \\
+    --output model_conversion\\onnx\\uhd_relu_w96_single.onnx \\
+    --constants model_conversion\\onnx\\uhd_relu_w96_constants.npz
+        """
     )
     parser.add_argument(
         "--input",
         required=True,
-        help="Input ONNX model path (_nopost.onnx)"
+        help="Input ONNX model path (_nopost.onnx from w_ESE+IoU-aware+ReLU folder)"
     )
     parser.add_argument(
         "--output",
@@ -123,7 +138,7 @@ def main():
     parser.add_argument(
         "--constants",
         default=None,
-        help="Output path for constants (.npz file)"
+        help="Output path for constants (.npz file). Will be auto-generated if not specified."
     )
     
     args = parser.parse_args()

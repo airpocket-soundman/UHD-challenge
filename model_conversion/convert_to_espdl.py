@@ -107,15 +107,23 @@ def convert_onnx_to_espdl(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert ONNX model to ESP-DL format (.espdl)",
+        description="Convert ONNX model to ESP-DL format (.espdl) with INT8 quantization",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
-  # Convert UHD N model
-  python convert_to_espdl.py \\
-    --model model_conversion/onnx/ultratinyod_res_anc8_w64_64x64_quality.onnx \\
-    --output model_conversion/uhd_n_w64 \\
+  # ReLU version w64 (recommended)
+  python model_conversion\\convert_to_espdl.py \\
+    --model model_conversion\\onnx\\uhd_relu_w64_single.onnx \\
+    --output model_conversion\\esp_dl\\uhd_n_w64_relu \\
     --input-shape 1,3,64,64
+
+  # ReLU version w96
+  python model_conversion\\convert_to_espdl.py \\
+    --model model_conversion\\onnx\\uhd_relu_w96_single.onnx \\
+    --output model_conversion\\esp_dl\\uhd_t_w96_relu \\
+    --input-shape 1,3,64,64
+
+Note: Input model should be the single-output model created by create_single_output_model.py
         """
     )
     

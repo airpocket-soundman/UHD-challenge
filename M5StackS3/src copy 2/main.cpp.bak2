@@ -1,0 +1,721 @@
+#include <Arduino.h>
+
+#include <M5Unified.h>
+#include <esp_camera.h>
+
+#include <SPI.h>
+#include <SD.h>
+
+// ESP-DL includes
+// Note: ESP-DL requires ESP-IDF framework, not available in Arduino Framework
+// TODO: Migrate to ESP-IDF or find Arduino-compatible alternative
+// #include "dl_model_base.hpp"
+#include <cmath>
+#include <vector>
+#include <algorithm>
+
+//-------------------- LCD --------------------
+#define LCD_WIDTH   (320)
+#define LCD_HEIGHT  (240)
+
+// クロップ後の正方形領域
+#define CROP_SIZE   (240)
+
+// NN 入力サイズ
+#define NN_INPUT_SIZE  (64)
+
+//-------------------- SD Card (SPI) --------------------
+#define SD_SPI_SCK_PIN   36
+#define SD_SPI_MISO_PIN  35
+#define SD_SPI_MOSI_PIN  37
+#define SD_SPI_CS_PIN    4
+
+// モデルファイルパス（microSDのルートに配置）
+// Note: SDライブラリでは /sdcard/ プレフィックスは不要
+#define MODEL_ESPDL_PATH  "/model.espdl"
+#define MODEL_JSON_PATH   "/model.json"
+
+//-------------------- モデル定数 --------------------
+#define NUM_ANCHORS  8
+#define NUM_CLASSES  80  // COCO classes
+#define GRID_SIZE    8   // 8x8 grid
+#define CONFIDENCE_THRESHOLD  0.3f
+#define NMS_THRESHOLD  0.5f
+
+//-------------------- Camera config --------------------
+static camera_config_t camera_config = {
+    .pin_pwdn     = -1,
+    .pin_reset    = -1,
+    .pin_xclk     = 2,
+    .pin_sscb_sda = 12,
+    .pin_sscb_scl = 11,
+
+    .pin_d7 = 47,
+    .pin_d6 = 48,
+    .pin_d5 = 16,
+    .pin_d4 = 15,
+    .pin_d3 = 42,
+    .pin_d2 = 41,
+    .pin_d1 = 40,
+    .pin_d0 = 39,
+
+    .pin_vsync = 46,
+    .pin_href  = 38,
+    .pin_pclk  = 45,
+
+    .xclk_freq_hz = 20000000,
+    .ledc_timer   = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+
+    .pixel_format = PIXFORMAT_RGB565,
+    .frame_size   = FRAMESIZE_QVGA,   // 320x240
+    .jpeg_quality = 0,
+    .fb_count     = 2,
+    .fb_location  = CAMERA_FB_IN_PSRAM,
+    .grab_mode    = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+//-------------------- グローバルバッファ --------------------
+// 320x240 → 中央 240x240 にトリミングした RGB565 画像
+static uint16_t g_crop240[CROP_SIZE * CROP_SIZE];
+
+// 64x64 RGB画像（ESP-DL入力用、正規化済み [0,1]）
+static float g_nn_input[NN_INPUT_SIZE * NN_INPUT_SIZE * 3];
+
+// SD / モデル状態
+static bool g_sd_ok        = false;
+static bool g_model_loaded = false;
+
+// ESP-DLモデルとモデル定数
+// Note: Temporarily disabled until ESP-IDF migration
+// static dl::Model *g_model = nullptr;
+static void *g_model = nullptr;  // Dummy placeholder
+
+struct ModelConstants {
+    float anchors[NUM_ANCHORS][2];
+    float wh_scale[NUM_ANCHORS][2];
+};
+static ModelConstants g_constants;
+
+// 検出結果
+struct Detection {
+    float x1, y1, x2, y2;  // バウンディングボックス座標（64x64画像座標系）
+    float confidence;
+    int class_id;
+};
+
+//-------------------- ユーティリティ --------------------
+
+// RGB565 → RGB888 変換（正規化 [0,1]）
+static inline void rgb565_to_rgb_normalized(uint16_t c, float &r, float &g, float &b)
+{
+    uint8_t r8 = ((c >> 11) & 0x1F) << 3;
+    uint8_t g8 = ((c >> 5)  & 0x3F) << 2;
+    uint8_t b8 = (c & 0x1F) << 3;
+    
+    r = r8 / 255.0f;
+    g = g8 / 255.0f;
+    b = b8 / 255.0f;
+}
+
+// sigmoid関数
+static inline float sigmoid(float x) {
+    return 1.0f / (1.0f + expf(-x));
+}
+
+// g_crop240 上に枠線（BB）を描く
+void draw_rectangle(uint16_t *img, int width, int height,
+                    int x1, int y1, int x2, int y2,
+                    uint16_t color, int thickness = 2)
+{
+    if (x1 > x2) { int t = x1; x1 = x2; x2 = t; }
+    if (y1 > y2) { int t = y1; y1 = y2; y2 = t; }
+
+    if (x1 < 0) x1 = 0;
+    if (y1 < 0) y1 = 0;
+    if (x2 >= width)  x2 = width - 1;
+    if (y2 >= height) y2 = height - 1;
+
+    // 太さを考慮
+    for (int t = 0; t < thickness; ++t) {
+        // 上下の辺
+        if (y1 + t < height) {
+            for (int x = x1; x <= x2; ++x) {
+                img[(y1 + t) * width + x] = color;
+            }
+        }
+        if (y2 - t >= 0) {
+            for (int x = x1; x <= x2; ++x) {
+                img[(y2 - t) * width + x] = color;
+            }
+        }
+        
+        // 左右の辺
+        if (x1 + t < width) {
+            for (int y = y1; y <= y2; ++y) {
+                img[y * width + (x1 + t)] = color;
+            }
+        }
+        if (x2 - t >= 0) {
+            for (int y = y1; y <= y2; ++y) {
+                img[y * width + (x2 - t)] = color;
+            }
+        }
+    }
+}
+
+//-------------------- SD & モデル読み込み --------------------
+
+bool load_model_constants()
+{
+    // JSONファイルから読み込む（簡易パーサー）
+    File f = SD.open(MODEL_JSON_PATH);
+    if (!f) {
+        Serial.printf("Failed to open %s\n", MODEL_JSON_PATH);
+        return false;
+    }
+
+    // JSONファイルを読み込んで anchors と wh_scale を抽出
+    // 簡易実装：固定フォーマットを想定
+    String json = f.readString();
+    f.close();
+    
+    // anchors を探す
+    int anchors_pos = json.indexOf("\"anchors\"");
+    if (anchors_pos < 0) {
+        Serial.println("anchors not found in JSON");
+        return false;
+    }
+    
+    // anchorsの配列開始位置を探す
+    int array_start = json.indexOf("[", anchors_pos);
+    int array_end = json.indexOf("]", array_start);
+    if (array_start < 0 || array_end < 0) {
+        Serial.println("anchors array not found");
+        return false;
+    }
+    
+    String anchors_str = json.substring(array_start + 1, array_end);
+    // カンマで分割して値を取得
+    int anchor_idx = 0;
+    int pos = 0;
+    while (pos < anchors_str.length() && anchor_idx < NUM_ANCHORS * 2) {
+        int comma_pos = anchors_str.indexOf(",", pos);
+        if (comma_pos < 0) comma_pos = anchors_str.length();
+        
+        String val_str = anchors_str.substring(pos, comma_pos);
+        val_str.trim();
+        float val = val_str.toFloat();
+        
+        g_constants.anchors[anchor_idx / 2][anchor_idx % 2] = val;
+        anchor_idx++;
+        pos = comma_pos + 1;
+    }
+    
+    // wh_scale を探す
+    int wh_scale_pos = json.indexOf("\"wh_scale\"");
+    if (wh_scale_pos < 0) {
+        Serial.println("wh_scale not found in JSON");
+        return false;
+    }
+    
+    array_start = json.indexOf("[", wh_scale_pos);
+    array_end = json.indexOf("]", array_start);
+    if (array_start < 0 || array_end < 0) {
+        Serial.println("wh_scale array not found");
+        return false;
+    }
+    
+    String wh_scale_str = json.substring(array_start + 1, array_end);
+    int wh_idx = 0;
+    pos = 0;
+    while (pos < wh_scale_str.length() && wh_idx < NUM_ANCHORS * 2) {
+        int comma_pos = wh_scale_str.indexOf(",", pos);
+        if (comma_pos < 0) comma_pos = wh_scale_str.length();
+        
+        String val_str = wh_scale_str.substring(pos, comma_pos);
+        val_str.trim();
+        float val = val_str.toFloat();
+        
+        g_constants.wh_scale[wh_idx / 2][wh_idx % 2] = val;
+        wh_idx++;
+        pos = comma_pos + 1;
+    }
+
+    Serial.println("Model constants loaded successfully from JSON");
+    Serial.println("Anchors:");
+    for (int i = 0; i < NUM_ANCHORS; ++i) {
+        Serial.printf("  [%d]: %.6e, %.6e\n", i, g_constants.anchors[i][0], g_constants.anchors[i][1]);
+    }
+    Serial.println("WH Scale:");
+    for (int i = 0; i < NUM_ANCHORS; ++i) {
+        Serial.printf("  [%d]: %.6f, %.6f\n", i, g_constants.wh_scale[i][0], g_constants.wh_scale[i][1]);
+    }
+
+    return true;
+}
+
+bool init_sd_and_load_model()
+{
+    // SPI 初期化（I2C には一切触らない）
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
+
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("Checking SD card...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    Serial.println("Checking SD card...");
+    delay(500);
+
+    if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
+        M5.Display.fillScreen(BLACK);
+        M5.Display.drawString("SD card NOT detected!", LCD_WIDTH / 2, LCD_HEIGHT / 2 - 20);
+        M5.Display.drawString("Please insert SD card", LCD_WIDTH / 2, LCD_HEIGHT / 2 + 20);
+        Serial.println("ERROR: SD card NOT detected!");
+        g_sd_ok = false;
+        g_model_loaded = false;
+        return false;
+    }
+
+    g_sd_ok = true;
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("SD card OK", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    Serial.println("SD card detected successfully");
+    delay(2000);  // 2秒表示
+
+    // モデルファイルの存在チェック
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("Checking files...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    delay(1000);  // 1秒表示
+
+    if (!SD.exists(MODEL_ESPDL_PATH)) {
+        M5.Display.fillScreen(BLACK);
+        M5.Display.drawString("model.espdl NOT found!", LCD_WIDTH / 2, LCD_HEIGHT / 2 - 20);
+        M5.Display.drawString("on SD card", LCD_WIDTH / 2, LCD_HEIGHT / 2 + 20);
+        Serial.printf("ERROR: File not found: %s\n", MODEL_ESPDL_PATH);
+        g_model_loaded = false;
+        return false;
+    }
+    File espdl_file = SD.open(MODEL_ESPDL_PATH);
+    if (espdl_file) {
+        size_t espdl_size = espdl_file.size();
+        espdl_file.close();
+        Serial.printf("model.espdl found (size: %u bytes)\n", espdl_size);
+    } else {
+        Serial.println("model.espdl found but cannot open");
+    }
+
+    if (!SD.exists(MODEL_JSON_PATH)) {
+        M5.Display.fillScreen(BLACK);
+        M5.Display.drawString("model.json NOT found!", LCD_WIDTH / 2, LCD_HEIGHT / 2 - 20);
+        M5.Display.drawString("on SD card", LCD_WIDTH / 2, LCD_HEIGHT / 2 + 20);
+        Serial.printf("ERROR: File not found: %s\n", MODEL_JSON_PATH);
+        g_model_loaded = false;
+        return false;
+    }
+    File json_file = SD.open(MODEL_JSON_PATH);
+    if (json_file) {
+        size_t json_size = json_file.size();
+        json_file.close();
+        Serial.printf("model.json found (size: %u bytes)\n", json_size);
+    } else {
+        Serial.println("model.json found but cannot open");
+        return false;
+    }
+
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("Both files found!", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    Serial.println("Both model files found on SD card");
+    delay(2000);  // 2秒表示
+    
+    // 定数ファイルをロード（これは使用可能）
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("Loading constants...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    Serial.println("Loading model constants from model.bin...");
+    delay(500);  // 0.5秒表示
+    
+    if (!load_model_constants()) {
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setTextSize(1);
+        M5.Display.drawString("Failed to read", LCD_WIDTH / 2, LCD_HEIGHT / 2 - 30);
+        M5.Display.drawString("model.bin data!", LCD_WIDTH / 2, LCD_HEIGHT / 2 - 10);
+        M5.Display.drawString("File may be corrupt", LCD_WIDTH / 2, LCD_HEIGHT / 2 + 10);
+        M5.Display.drawString("or wrong format", LCD_WIDTH / 2, LCD_HEIGHT / 2 + 30);
+        Serial.println("ERROR: Failed to read model.bin");
+        Serial.println("File may be corrupt or in wrong format");
+        delay(5000);  // 5秒表示してエラー内容を確認
+        g_model_loaded = false;
+        return false;
+    }
+    
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("Constants loaded OK", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    Serial.println("model.bin loaded successfully");
+    delay(2000);  // 2秒表示
+    
+    // ESP-DLモデルのロードはスキップ（ESP-IDF必要）
+    Serial.println("Note: ESP-DL requires ESP-IDF framework");
+    Serial.println("Running in dummy inference mode");
+    
+    g_model_loaded = false;  // Always dummy mode until ESP-IDF migration
+    return true;  // Return true to indicate setup success (constants loaded)
+}
+
+//-------------------- カメラ初期化 --------------------
+
+esp_err_t camera_init()
+{
+    // M5Unified が掴んでいる I2C を開放（元コードと同じ）
+    M5.In_I2C.release();
+
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        M5.Display.println("Camera Init Failed");
+        Serial.printf("Camera Init Failed: 0x%x\n", err);
+        return err;
+    }
+
+    return ESP_OK;
+}
+
+//-------------------- 前処理：fb → 240x240 → 64x64 RGB --------------------
+
+void prepare_cropped_and_resized(camera_fb_t *fb)
+{
+    // fb は 320x240 RGB565 前提
+    const int src_w = fb->width;   // 320
+    const int src_h = fb->height;  // 240
+
+    const uint16_t *src = (const uint16_t *)fb->buf;
+
+    // 320x240 → 中央 240x240 を切り出す
+    const int crop_w = CROP_SIZE;
+    const int crop_h = CROP_SIZE;
+    const int crop_x0 = (src_w - crop_w) / 2; // 40
+    const int crop_y0 = 0;                    // 上から
+
+    for (int y = 0; y < crop_h; ++y) {
+        int sy = crop_y0 + y;
+        int src_row_offset = sy * src_w;
+        int dst_row_offset = y * crop_w;
+
+        for (int x = 0; x < crop_w; ++x) {
+            int sx = crop_x0 + x;
+            g_crop240[dst_row_offset + x] = src[src_row_offset + sx];
+        }
+    }
+
+    // 240x240 → 64x64 へ最近傍補間で縮小（RGB正規化 [0,1]）
+    for (int y = 0; y < NN_INPUT_SIZE; ++y) {
+        int sy = y * crop_h / NN_INPUT_SIZE;
+        for (int x = 0; x < NN_INPUT_SIZE; ++x) {
+            int sx = x * crop_w / NN_INPUT_SIZE;
+            uint16_t pix = g_crop240[sy * crop_w + sx];
+            
+            float r, g, b;
+            rgb565_to_rgb_normalized(pix, r, g, b);
+            
+            // CHW形式で格納 (C=3, H=64, W=64)
+            int base_idx = y * NN_INPUT_SIZE + x;
+            g_nn_input[0 * NN_INPUT_SIZE * NN_INPUT_SIZE + base_idx] = r;
+            g_nn_input[1 * NN_INPUT_SIZE * NN_INPUT_SIZE + base_idx] = g;
+            g_nn_input[2 * NN_INPUT_SIZE * NN_INPUT_SIZE + base_idx] = b;
+        }
+    }
+}
+
+//-------------------- ESP-DL推論 --------------------
+
+std::vector<Detection> run_inference()
+{
+    std::vector<Detection> detections;
+
+    // TODO: ESP-DL requires ESP-IDF framework
+    // Currently running in dummy mode
+    
+    // モデルがロードされていない場合はダミーBBを返す
+    Detection dummy;
+    dummy.x1 = 20;
+    dummy.y1 = 20;
+    dummy.x2 = 44;
+    dummy.y2 = 44;
+    dummy.confidence = 0.8f;
+    dummy.class_id = 0;
+    detections.push_back(dummy);
+    
+    Serial.println("Running in dummy mode (ESP-DL not available)");
+    
+    return detections;
+
+    /*
+    // ===== ESP-DL inference code (requires ESP-IDF) =====
+    if (!g_model_loaded || !g_model) {
+        Detection dummy;
+        dummy.x1 = 20;
+        dummy.y1 = 20;
+        dummy.x2 = 44;
+        dummy.y2 = 44;
+        dummy.confidence = 0.8f;
+        dummy.class_id = 0;
+        detections.push_back(dummy);
+        return detections;
+    }
+
+    // 1. 入力テンソルを準備
+    dl::Tensor<float> input;
+    input.set_element((float*)g_nn_input);
+    input.set_shape({1, 3, NN_INPUT_SIZE, NN_INPUT_SIZE});
+    input.set_auto_free(false);
+
+    // 2. 推論実行
+    std::vector<dl::Tensor<float>> outputs = g_model->forward(input);
+    
+    if (outputs.empty()) {
+        Serial.println("Model forward failed");
+        return detections;
+    }
+
+    // 3. 出力テンソル pred [1, 56, 8, 8] を取得
+    dl::Tensor<float>& pred = outputs[0];
+    float* pred_data = pred.get_element_ptr();
+    
+    // pred shape: [1, C, H, W] = [1, 56, 8, 8]
+    // C = 56 = 7 * 8 (7要素 × 8アンカー)
+    // 7要素 = [tx, ty, tw, th, obj, class, quality]
+    
+    const int per_anchor = 7;  // 各アンカーの要素数
+    
+    // 4. デコード処理
+    for (int a = 0; a < NUM_ANCHORS; ++a) {
+        for (int gy = 0; gy < GRID_SIZE; ++gy) {
+            for (int gx = 0; gx < GRID_SIZE; ++gx) {
+                // 各要素へのインデックス計算
+                // pred[0, a*7+i, gy, gx]
+                int base_c = a * per_anchor;
+                int grid_idx = gy * GRID_SIZE + gx;
+                int stride_h = GRID_SIZE * GRID_SIZE;
+                
+                float tx = pred_data[(base_c + 0) * stride_h + grid_idx];
+                float ty = pred_data[(base_c + 1) * stride_h + grid_idx];
+                float tw = pred_data[(base_c + 2) * stride_h + grid_idx];
+                float th = pred_data[(base_c + 3) * stride_h + grid_idx];
+                float obj = pred_data[(base_c + 4) * stride_h + grid_idx];
+                float cls = pred_data[(base_c + 5) * stride_h + grid_idx];
+                float quality = pred_data[(base_c + 6) * stride_h + grid_idx];
+                
+                // スコア計算: obj_conf * quality_conf * class_conf
+                float obj_conf = sigmoid(obj);
+                float quality_conf = sigmoid(quality);
+                float cls_conf = sigmoid(cls);
+                float score = obj_conf * quality_conf * cls_conf;
+                
+                // 信頼度フィルタリング
+                if (score < CONFIDENCE_THRESHOLD) {
+                    continue;
+                }
+                
+                // バウンディングボックスのデコード
+                // cx, cy: グリッド座標系での中心位置（正規化 [0,1]）
+                float cx = (sigmoid(tx) + gx) / float(GRID_SIZE);
+                float cy = (sigmoid(ty) + gy) / float(GRID_SIZE);
+                
+                // softplus(x) ≈ log(1 + exp(x))
+                // 簡易版: x > 0 なら x, x <= 0 なら log(1 + exp(x))
+                auto softplus = [](float x) -> float {
+                    if (x > 20.0f) return x;  // 数値安定性
+                    if (x < -20.0f) return 0.0f;
+                    return logf(1.0f + expf(x));
+                };
+                
+                // アンカーとスケールを使って幅・高さを計算
+                float pw = g_constants.anchors[a][0] * g_constants.wh_scale[a][0];
+                float ph = g_constants.anchors[a][1] * g_constants.wh_scale[a][1];
+                float bw = pw * softplus(tw);
+                float bh = ph * softplus(th);
+                
+                // cx, cy, bw, bh は正規化座標 [0,1]
+                // 64x64ピクセル座標系に変換
+                float cx_pix = cx * NN_INPUT_SIZE;
+                float cy_pix = cy * NN_INPUT_SIZE;
+                float bw_pix = bw * NN_INPUT_SIZE;
+                float bh_pix = bh * NN_INPUT_SIZE;
+                
+                // バウンディングボックス座標
+                float x1 = cx_pix - bw_pix / 2.0f;
+                float y1 = cy_pix - bh_pix / 2.0f;
+                float x2 = cx_pix + bw_pix / 2.0f;
+                float y2 = cy_pix + bh_pix / 2.0f;
+                
+                // クランプ [0, 64)
+                x1 = fmaxf(0.0f, fminf(x1, NN_INPUT_SIZE - 1.0f));
+                y1 = fmaxf(0.0f, fminf(y1, NN_INPUT_SIZE - 1.0f));
+                x2 = fmaxf(0.0f, fminf(x2, NN_INPUT_SIZE - 1.0f));
+                y2 = fmaxf(0.0f, fminf(y2, NN_INPUT_SIZE - 1.0f));
+                
+                // 有効なバウンディングボックスかチェック
+                if (x2 <= x1 || y2 <= y1) {
+                    continue;
+                }
+                
+                // 検出結果を追加
+                Detection det;
+                det.x1 = x1;
+                det.y1 = y1;
+                det.x2 = x2;
+                det.y2 = y2;
+                det.confidence = score;
+                det.class_id = 0;  // 簡易版：1クラスのみ
+                
+                detections.push_back(det);
+            }
+        }
+    }
+    
+    // 簡易NMS: 信頼度でソートして上位のみ残す
+    if (detections.size() > 10) {
+        std::sort(detections.begin(), detections.end(), 
+                  [](const Detection& a, const Detection& b) {
+                      return a.confidence > b.confidence;
+                  });
+        detections.resize(10);
+    }
+    
+    Serial.printf("Detected %d objects\n", detections.size());
+    
+    return detections;
+    */
+}
+
+//-------------------- カメラキャプチャ＋推論＋描画 --------------------
+
+void camera_capture_and_display()
+{
+    // M5Unified の I2C を離してからカメラが I2C を掴む
+    M5.In_I2C.release();
+
+    camera_fb_t *fb = esp_camera_fb_get();
+    if (!fb) {
+        M5.Display.println("Camera Capture Failed");
+        Serial.println("Camera Capture Failed");
+        return;
+    }
+
+    // 前処理：fb -> g_crop240(240x240) & g_nn_input(64x64 RGB)
+    prepare_cropped_and_resized(fb);
+
+    // 推論実行
+    std::vector<Detection> detections = run_inference();
+
+    // 検出結果を描画
+    const uint16_t RED = 0xF800;
+    const uint16_t GREEN = 0x07E0;
+    const uint16_t BLUE = 0x001F;
+    
+    // スケール係数: 64x64 → 240x240
+    const float scale = 240.0f / 64.0f;  // = 3.75
+
+    for (const auto &det : detections) {
+        if (det.confidence < CONFIDENCE_THRESHOLD) {
+            continue;
+        }
+
+        // 64x64座標から240x240座標へ変換
+        int x1_240 = (int)(det.x1 * scale);
+        int y1_240 = (int)(det.y1 * scale);
+        int x2_240 = (int)(det.x2 * scale);
+        int y2_240 = (int)(det.y2 * scale);
+
+        // バウンディングボックスを描画
+        uint16_t color = (det.class_id == 0) ? RED : GREEN;
+        draw_rectangle(g_crop240, CROP_SIZE, CROP_SIZE,
+                       x1_240, y1_240, x2_240, y2_240,
+                       color, 2);
+
+        // 信頼度表示（オプション）
+        // Serial.printf("Det: class=%d, conf=%.2f, bbox=(%.1f,%.1f,%.1f,%.1f)\n",
+        //               det.class_id, det.confidence, det.x1, det.y1, det.x2, det.y2);
+    }
+
+    // 240x240 をディスプレイに表示
+    // 320x240 の中央に 240x240 を置く
+    int dst_x = (LCD_WIDTH  - CROP_SIZE) / 2; // 40
+    int dst_y = (LCD_HEIGHT - CROP_SIZE) / 2; // 0
+
+    M5.Display.startWrite();
+    M5.Display.setAddrWindow(dst_x, dst_y, CROP_SIZE, CROP_SIZE);
+    M5.Display.writePixels(g_crop240, CROP_SIZE * CROP_SIZE);
+    M5.Display.endWrite();
+
+    // フレームバッファを返却
+    esp_camera_fb_return(fb);
+}
+
+//-------------------- setup / loop --------------------
+
+void setup()
+{
+    auto cfg = M5.config();
+    cfg.output_power = true; // 外部 5V 出力
+    M5.begin(cfg);
+
+    // M5.begin()の後にSerialを初期化
+    Serial.begin(115200);
+    delay(500);
+    
+    Serial.println("\n\n=== M5Stack S3 + ESP-DL UHD Detector ===");
+    Serial.println("Starting initialization...");
+
+    M5.Display.setRotation(1);
+    M5.Display.setTextDatum(textdatum_t::middle_center);
+    M5.Display.setFont(&fonts::efontJA_16);
+    M5.Display.setTextColor(WHITE, BLACK);
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("Initializing...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+
+    delay(1000);
+
+    // SD & モデル読み込み
+    Serial.println("Checking SD card...");
+    if (!init_sd_and_load_model()) {
+        M5.Display.fillScreen(BLACK);
+        M5.Display.drawString("Model load failed", LCD_WIDTH / 2, LCD_HEIGHT / 2 - 20);
+        M5.Display.drawString("Check SD card", LCD_WIDTH / 2, LCD_HEIGHT / 2 + 20);
+        Serial.println("=== Model loading failed ===");
+        delay(3000);  // 3秒表示
+        // ダミーモードで続行
+        g_model_loaded = false;
+    } else {
+        Serial.println("=== Model files found ===");
+        delay(2000);  // 2秒表示
+    }
+
+    // カメラ初期化
+    M5.Display.fillScreen(BLACK);
+    M5.Display.drawString("Init camera...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    Serial.println("Initializing camera...");
+    if (camera_init() != ESP_OK) {
+        M5.Display.fillScreen(BLACK);
+        M5.Display.drawString("Camera init failed", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+        Serial.println("=== Camera init failed ===");
+        delay(3000);  // 3秒表示
+        while(1) { delay(1000); }
+    }
+    Serial.println("Camera initialized successfully");
+
+    M5.Display.fillScreen(BLACK);
+    if (g_model_loaded) {
+        M5.Display.drawString("ESP-DL Model Ready", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+        Serial.println("=== ESP-DL Model Ready ===");
+    } else {
+        M5.Display.drawString("Dummy mode (no model)", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+        Serial.println("=== Running in dummy mode ===");
+    }
+
+    delay(3000);  // 3秒表示
+    M5.Display.fillScreen(BLACK);
+}
+
+void loop()
+{
+    camera_capture_and_display();
+    // フレームレート調整（オプション）
+    // delay(30);
+}

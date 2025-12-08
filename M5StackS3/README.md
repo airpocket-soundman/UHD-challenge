@@ -74,10 +74,97 @@
   - MOSI ＝ 37  
   - CS ＝ 4  
 
-### 4. **モデルファイル読み込み**
-- モデルファイル名：`/UHD64x64.model`
-- microSDの存在チェックのみ実施
-- 中身はまだ読み込まない（ESP-DL統合前段階）
+### 4. **モデルファイル読み込み（ESP-DL形式）**
+
+#### 📄 microSDに配置するファイル
+
+microSDのルートに以下の2ファイルを配置：
+
+```
+microSD (root)/
+  ├── model.espdl  (約1.68 MB) - ESP-DL形式の物体検出モデル（INT8量子化済み）
+  └── model.bin    (128 bytes)  - anchors/wh_scale定数ファイル
+```
+
+#### 🔧 ファイル形式の詳細
+
+**1. model.espdl（モデルファイル）**
+- 形式：ESP-DL標準モデルフォーマット（FlatBuffers）
+- 内容：UltraTinyOD ReLU版 w64モデル（INT8量子化済み）
+- 入力：64×64 RGB画像、正規化 [0,1]
+- 出力：pred `[1, 56, 8, 8]` - 物体検出の生予測値
+- サイズ：約1.68 MB
+- ESP-DLのモデルローダーで読み込み可能
+
+**2. model.bin（定数ファイル）**
+- 形式：バイナリ（float32配列）
+- 内容：
+  - anchors: `[8, 2]` - 8種類のアンカーボックスサイズ
+  - wh_scale: `[8, 2]` - 幅・高さのスケール係数
+- サイズ：128 bytes（16個のfloat32値）
+- 構造：
+  ```
+  [0-63 bytes]   : anchors (8個 × 2次元 × 4bytes)
+  [64-127 bytes] : wh_scale (8個 × 2次元 × 4bytes)
+  ```
+
+#### 📝 読み込み方法
+
+**モデルの読み込み**:
+```cpp
+#include "dl_model_base.hpp"
+
+// SDカードをマウント
+ESP_ERROR_CHECK(bsp_sdcard_mount());
+
+// モデルをロード
+Model *model = new Model("/sdcard/model.espdl", fbs::MODEL_LOCATION_IN_SDCARD);
+```
+
+**定数の読み込み**:
+```cpp
+struct ModelConstants {
+    float anchors[8][2];
+    float wh_scale[8][2];
+};
+
+ModelConstants load_constants() {
+    ModelConstants consts;
+    FILE* f = fopen("/sdcard/model.bin", "rb");
+    if (f) {
+        fread(consts.anchors, sizeof(float), 8 * 2, f);
+        fread(consts.wh_scale, sizeof(float), 8 * 2, f);
+        fclose(f);
+        ESP_LOGI(TAG, "Constants loaded successfully");
+    }
+    return consts;
+}
+```
+
+#### ⚠️ 重要な注意事項
+
+1. **ファイル名は固定**
+   - 必ず `model.espdl` と `model.bin` という名前で保存
+   - 大文字小文字を区別（小文字推奨）
+
+2. **配置場所はルート**
+   - microSDカードのルートディレクトリに配置
+   - サブフォルダには置かない
+
+3. **モデルの対応関係**
+   - .espdlと.binは対のファイル
+   - 異なるバリアント（w64, w96等）を使う場合は、両方を同時に変更
+
+4. **メモリ要件**
+   - ESP-DLはmicroSDから自動的にPSRAM/内部RAMにモデルをコピー
+   - M5Stack S3のPSRAM（8MB）で十分対応可能
+
+#### 🎯 現在の実装状態
+
+- ✅ microSD読み込み機能実装済み
+- ⏳ ESP-DLモデルローダー統合中
+- ⏳ 定数ファイル読み込み未実装
+- ⏳ 実推論処理未実装（現在はダミーBB表示）
 
 ---
 

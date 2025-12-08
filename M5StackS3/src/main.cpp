@@ -6,6 +6,15 @@
 #include <SPI.h>
 #include <SD.h>
 
+// ========================= ESP-DL =========================
+// Arduino + ESP-IDF ハイブリッドで読み込む
+extern "C" {
+#include "dl_model_base.h"
+}
+#include "dl_model_base.hpp"
+using namespace dl;
+
+//============================================================
 //-------------------- LCD --------------------
 #define LCD_WIDTH   (320)
 #define LCD_HEIGHT  (240)
@@ -17,15 +26,20 @@
 #define NN_INPUT_SIZE  (64)
 
 //-------------------- SD Card (SPI) --------------------
-// ※あなたが提示してくれた CoreS3 用ピンをそのまま使用
 #define SD_SPI_SCK_PIN   36
 #define SD_SPI_MISO_PIN  35
 #define SD_SPI_MOSI_PIN  37
 #define SD_SPI_CS_PIN    4
 
-// モデルファイルパス（microSDのルートに置く想定）
-// 例: /UHD64x64.model
-#define MODEL_FILE_PATH  "/UHD64x64.model"
+// モデルファイルパス（microSDのルートに配置）
+#define MODEL_ESPDL_PATH  "/model.espdl"
+#define MODEL_JSON_PATH   "/model.json"
+
+//-------------------- モデル定数 --------------------
+#define NUM_ANCHORS  8
+#define NUM_CLASSES  80  // COCO classes
+#define GRID_SIZE    8   // 8x8 grid
+#define CONFIDENCE_THRESHOLD  0.3f
 
 //-------------------- Camera config --------------------
 static camera_config_t camera_config = {
@@ -61,259 +75,284 @@ static camera_config_t camera_config = {
 };
 
 //-------------------- グローバルバッファ --------------------
-// 320x240 → 中央 240x240 にトリミングした RGB565 画像
 static uint16_t g_crop240[CROP_SIZE * CROP_SIZE];
-
-// 240x240 → 64x64 に縮小した NN 入力画像（ここではグレースケール1ch）
-static uint8_t  g_nn_input[NN_INPUT_SIZE * NN_INPUT_SIZE];
+static float g_nn_input[NN_INPUT_SIZE * NN_INPUT_SIZE * 3];
 
 // SD / モデル状態
 static bool g_sd_ok        = false;
 static bool g_model_loaded = false;
 
-//-------------------- ユーティリティ --------------------
+// ESP-DL model instance
+static dl::Model *g_model = nullptr;
 
-// RGB565 → グレースケール(0-255) 変換
-static inline uint8_t rgb565_to_gray(uint16_t c)
+struct ModelConstants {
+    float anchors[NUM_ANCHORS][2];
+    float wh_scale[NUM_ANCHORS][2];
+};
+static ModelConstants g_constants;
+
+// 検出結果構造体
+struct Detection {
+    float x1, y1, x2, y2;
+    float confidence;
+    int class_id;
+};
+
+//============================================================
+//-------------------- Utility --------------------
+static inline void rgb565_to_rgb_normalized(uint16_t c, float &r, float &g, float &b)
 {
-    uint8_t r = ((c >> 11) & 0x1F) << 3;
-    uint8_t g = ((c >> 5)  & 0x3F) << 2;
-    uint8_t b = (c & 0x1F) << 3;
-    // NTSC比率っぽく
-    return (uint8_t)((r * 30 + g * 59 + b * 11) / 100);
+    uint8_t r8 = ((c >> 11) & 0x1F) << 3;
+    uint8_t g8 = ((c >> 5)  & 0x3F) << 2;
+    uint8_t b8 = (c & 0x1F) << 3;
+    
+    r = r8 / 255.0f;
+    g = g8 / 255.0f;
+    b = b8 / 255.0f;
 }
 
-// g_crop240 上に枠線（BB）を描く
 void draw_rectangle(uint16_t *img, int width, int height,
                     int x1, int y1, int x2, int y2,
-                    uint16_t color)
+                    uint16_t color, int thickness = 2)
 {
-    if (x1 > x2) { int t = x1; x1 = x2; x2 = t; }
-    if (y1 > y2) { int t = y1; y1 = y2; y2 = t; }
+    if (x1 > x2) std::swap(x1, x2);
+    if (y1 > y2) std::swap(y1, y2);
 
-    if (x1 < 0) x1 = 0;
-    if (y1 < 0) y1 = 0;
-    if (x2 >= width)  x2 = width - 1;
-    if (y2 >= height) y2 = height - 1;
+    for (int t = 0; t < thickness; ++t) {
+        if (y1+t < height)
+            for (int x = x1; x <= x2; ++x)
+                img[(y1+t)*width + x] = color;
+        if (y2-t >= 0)
+            for (int x = x1; x <= x2; ++x)
+                img[(y2-t)*width + x] = color;
 
-    // 上下の辺
-    for (int x = x1; x <= x2; ++x) {
-        img[y1 * width + x] = color;
-        img[y2 * width + x] = color;
-    }
-    // 左右の辺
-    for (int y = y1; y <= y2; ++y) {
-        img[y * width + x1] = color;
-        img[y * width + x2] = color;
+        if (x1+t < width)
+            for (int y = y1; y <= y2; ++y)
+                img[y*width + (x1+t)] = color;
+        if (x2-t >= 0)
+            for (int y = y1; y <= y2; ++y)
+                img[y*width + (x2-t)] = color;
     }
 }
 
-//-------------------- SD & モデル読み込み --------------------
-
-bool init_sd_and_check_model()
+//============================================================
+//-------------------- load model.json --------------------
+bool load_model_constants()
 {
-    // SPI 初期化（I2C には一切触らない）
-    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
-
-    if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
-        M5.Display.println("SD init failed");
-        Serial.println("SD init failed");
-        g_sd_ok = false;
-        g_model_loaded = false;
+    File f = SD.open(MODEL_JSON_PATH);
+    if (!f) {
+        Serial.println("Failed to open model.json");
         return false;
     }
 
-    g_sd_ok = true;
+    String json = f.readString();
+    f.close();
 
-    // モデルファイルの存在チェック
-    if (SD.exists(MODEL_FILE_PATH)) {
-        File f = SD.open(MODEL_FILE_PATH, FILE_READ);
-        if (!f) {
-            M5.Display.println("Model open failed");
-            Serial.println("Model open failed");
-            g_model_loaded = false;
-            return false;
+    auto parse_array = [&](const char *key, float out[][2]) -> bool {
+        int pos = json.indexOf(key);
+        if (pos < 0) return false;
+
+        int s = json.indexOf("[", pos);
+        int e = json.indexOf("]", s);
+        if (s < 0 || e < 0) return false;
+
+        String arr = json.substring(s+1, e);
+        int idx = 0;
+        int p = 0;
+
+        while (p < arr.length() && idx < NUM_ANCHORS * 2) {
+            int c = arr.indexOf(",", p);
+            if (c < 0) c = arr.length();
+
+            float v = arr.substring(p, c).trim().toFloat();
+            out[idx/2][idx%2] = v;
+
+            idx++;
+            p = c + 1;
         }
+        return true;
+    };
 
-        // 本当はここで ESP-DL 用にモデルデータを読み込む
-        // 現段階では「存在確認だけ」でフラグを立てて終わり
-        size_t size = f.size();
-        Serial.printf("Model file %s found, size = %u bytes\n",
-                      MODEL_FILE_PATH, (unsigned int)size);
-        f.close();
+    if (!parse_array("anchors", g_constants.anchors)) return false;
+    if (!parse_array("wh_scale", g_constants.wh_scale)) return false;
 
-        g_model_loaded = true;
-    } else {
-        M5.Display.println("Model file not found");
-        Serial.printf("Model file %s not found\n", MODEL_FILE_PATH);
-        g_model_loaded = false;
-    }
-
-    return g_model_loaded;
+    Serial.println("model.json constants loaded OK");
+    return true;
 }
 
-//-------------------- カメラ初期化 --------------------
+//============================================================
+//-------------------- init_sd_and_load_model() --------------------
+bool init_sd_and_load_model()
+{
+    SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
 
+    if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
+        Serial.println("SD init failed!");
+        return false;
+    }
+
+    Serial.println("SD OK");
+
+    if (!SD.exists(MODEL_ESPDL_PATH)) {
+        Serial.println("model.espdl not found");
+        return false;
+    }
+    if (!SD.exists(MODEL_JSON_PATH)) {
+        Serial.println("model.json not found");
+        return false;
+    }
+
+    Serial.println("model.espdl found");
+    Serial.println("model.json found");
+
+    if (!load_model_constants()) {
+        Serial.println("model.json read failed");
+        return false;
+    }
+
+    Serial.println("Loading ESP-DL model...");
+
+    g_model = new dl::Model(MODEL_ESPDL_PATH, fbs::MODEL_LOCATION_IN_SDCARD);
+    if (!g_model) {
+        Serial.println("g_model = nullptr");
+        return false;
+    }
+
+    if (!g_model->init()) {
+        Serial.println("g_model->init() failed!");
+        delete g_model;
+        g_model = nullptr;
+        return false;
+    }
+
+    Serial.println("ESP-DL model loaded OK!");
+    g_model_loaded = true;
+    return true;
+}
+
+//============================================================
+//-------------------- Camera init --------------------
 esp_err_t camera_init()
 {
-    // M5Unified が掴んでいる I2C を開放（元コードと同じ）
     M5.In_I2C.release();
-
     esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK) {
-        M5.Display.println("Camera Init Failed");
-        Serial.printf("Camera Init Failed: 0x%x\n", err);
-        return err;
-    }
-
-    return ESP_OK;
+    if (err != ESP_OK) Serial.printf("Camera init error: %x\n", err);
+    return err;
 }
 
-//-------------------- 前処理：fb → 240x240 → 64x64 --------------------
-
+//============================================================
+//-------------------- 前処理 --------------------
 void prepare_cropped_and_resized(camera_fb_t *fb)
 {
-    // fb は 320x240 RGB565 前提
-    const int src_w = fb->width;   // 320
-    const int src_h = fb->height;  // 240
-
     const uint16_t *src = (const uint16_t *)fb->buf;
 
-    // 320x240 → 中央 240x240 を切り出す
-    const int crop_w = CROP_SIZE;
-    const int crop_h = CROP_SIZE;
-    const int crop_x0 = (src_w - crop_w) / 2; // 40
-    const int crop_y0 = 0;                    // 上から
-
-    for (int y = 0; y < crop_h; ++y) {
-        int sy = crop_y0 + y;
-        int src_row_offset = sy * src_w;
-        int dst_row_offset = y * crop_w;
-
-        for (int x = 0; x < crop_w; ++x) {
-            int sx = crop_x0 + x;
-            g_crop240[dst_row_offset + x] = src[src_row_offset + sx];
+    for (int y = 0; y < CROP_SIZE; ++y) {
+        int sy = y;
+        for (int x = 0; x < CROP_SIZE; ++x) {
+            int sx = x + 40;   // center crop
+            g_crop240[y*CROP_SIZE + x] = src[sy*320 + sx];
         }
     }
 
-    // 240x240 → 64x64 へ最近傍補間で縮小（グレースケール）
     for (int y = 0; y < NN_INPUT_SIZE; ++y) {
-        int sy = y * crop_h / NN_INPUT_SIZE;
+        int sy = y * CROP_SIZE / NN_INPUT_SIZE;
         for (int x = 0; x < NN_INPUT_SIZE; ++x) {
-            int sx = x * crop_w / NN_INPUT_SIZE;
-            uint16_t pix = g_crop240[sy * crop_w + sx];
-            uint8_t gray = rgb565_to_gray(pix);
-            g_nn_input[y * NN_INPUT_SIZE + x] = gray;
+            int sx = x * CROP_SIZE / NN_INPUT_SIZE;
+            uint16_t pix = g_crop240[sy*CROP_SIZE + sx];
+
+            float r,g,b;
+            rgb565_to_rgb_normalized(pix, r, g, b);
+
+            int idx = y*NN_INPUT_SIZE + x;
+            g_nn_input[idx] = r;
+            g_nn_input[idx + NN_INPUT_SIZE*NN_INPUT_SIZE] = g;
+            g_nn_input[idx + NN_INPUT_SIZE*NN_INPUT_SIZE*2] = b;
         }
     }
 }
 
-//-------------------- ダミー推論ロジック --------------------
-
-// 本来はここで ESP-DL に g_nn_input を渡して推論する
-// いまは「モデルがあればとりあえず何か返す」「無ければダミーBB」にしておく
-void run_dummy_inference(int &out_x1, int &out_y1, int &out_x2, int &out_y2)
+//============================================================
+//-------------------- run_inference (dummy) --------------------
+std::vector<Detection> run_inference()
 {
+    std::vector<Detection> ds;
+
     if (!g_model_loaded) {
-        // モデルファイルが無い場合：指定どおりのダミーBB
-        out_x1 = 50;
-        out_y1 = 50;
-        out_x2 = 100;
-        out_y2 = 100;
-        return;
+        Detection d{20,20,44,44,0.9f,0};
+        ds.push_back(d);
+        return ds;
     }
 
-    // モデルはあるけど、まだ ESP-DL を繋いでいないので
-    // いったん「中央付近を囲う」ダミー挙動にしておく
-    // ※後でここを ESP-DL の出力に置き換えれば OK
-    out_x1 = CROP_SIZE / 2 - 40;
-    out_y1 = CROP_SIZE / 2 - 40;
-    out_x2 = CROP_SIZE / 2 + 40;
-    out_y2 = CROP_SIZE / 2 + 40;
+    // ★ ESP-DL 推論は後で実装する（いまはロード確認のみ）
+    Detection d{30,30,50,50,0.7f,0};
+    ds.push_back(d);
+
+    return ds;
 }
 
-//-------------------- カメラキャプチャ＋描画 --------------------
-
+//============================================================
+//-------------------- drawing --------------------
 void camera_capture_and_display()
 {
-    // M5Unified の I2C を離してからカメラが I2C を掴む（元コードと同じ）
     M5.In_I2C.release();
 
     camera_fb_t *fb = esp_camera_fb_get();
-    if (!fb) {
-        M5.Display.println("Camera Capture Failed");
-        Serial.println("Camera Capture Failed");
-        return;
-    }
+    if (!fb) return;
 
-    // 前処理：fb -> g_crop240(240x240) & g_nn_input(64x64)
     prepare_cropped_and_resized(fb);
 
-    // 推論（いまはダミー）
-    int bb_x1, bb_y1, bb_x2, bb_y2;
-    run_dummy_inference(bb_x1, bb_y1, bb_x2, bb_y2);
+    auto results = run_inference();
 
-    // g_crop240 上に BB を描く（赤）
+    float scale = 240.0f / 64.0f;
     const uint16_t RED = 0xF800;
-    draw_rectangle(g_crop240, CROP_SIZE, CROP_SIZE,
-                   bb_x1, bb_y1, bb_x2, bb_y2,
-                   RED);
 
-    // 240x240 をディスプレイに表示
-    // 320x240 の中央に 240x240 を置く
-    int dst_x = (LCD_WIDTH  - CROP_SIZE) / 2; // 40
-    int dst_y = (LCD_HEIGHT - CROP_SIZE) / 2; // 0
+    for (auto &d : results) {
+        int x1 = d.x1 * scale;
+        int y1 = d.y1 * scale;
+        int x2 = d.x2 * scale;
+        int y2 = d.y2 * scale;
+
+        draw_rectangle(g_crop240, 240, 240, x1,y1,x2,y2, RED, 2);
+    }
 
     M5.Display.startWrite();
-    M5.Display.setAddrWindow(dst_x, dst_y, CROP_SIZE, CROP_SIZE);
-    M5.Display.writePixels(g_crop240, CROP_SIZE * CROP_SIZE);
+    M5.Display.setAddrWindow(40, 0, 240, 240);
+    M5.Display.writePixels(g_crop240, 240*240);
     M5.Display.endWrite();
 
-    // フレームバッファを返却
     esp_camera_fb_return(fb);
 }
 
+//============================================================
 //-------------------- setup / loop --------------------
-
 void setup()
 {
-    Serial.begin(115200);
-
     auto cfg = M5.config();
-    cfg.output_power = true; // 外部 5V 出力
+    cfg.output_power = true;
     M5.begin(cfg);
 
-    M5.Display.setRotation(1);  // 必要に応じて
-    M5.Display.setTextDatum(textdatum_t::middle_center);
-    M5.Display.setFont(&fonts::efontJA_16);
-    M5.Display.setTextColor(WHITE, BLACK);
+    Serial.begin(115200);
+    delay(300);
+
     M5.Display.fillScreen(BLACK);
-    M5.Display.drawString("Init...", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+    M5.Display.drawString("Init...", 160,120);
 
-    // SD & モデルチェック
-    init_sd_and_check_model();
-
-    // カメラ初期化
-    if (camera_init() != ESP_OK) {
+    if (!init_sd_and_load_model()) {
+        Serial.println("Model load failed");
         M5.Display.fillScreen(BLACK);
-        M5.Display.drawString("Camera init failed", LCD_WIDTH / 2, LCD_HEIGHT / 2);
-        // ここで止めるか、リトライを書くかはお好みで
-        return;
-    }
-
-    M5.Display.fillScreen(BLACK);
-    if (g_model_loaded) {
-        M5.Display.drawString("Model OK (dummy inference)", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+        M5.Display.drawString("Model load failed",160,120);
+        g_model_loaded = false;
     } else {
-        M5.Display.drawString("No model -> dummy BB", LCD_WIDTH / 2, LCD_HEIGHT / 2);
+        Serial.println("Model OK");
     }
 
-    delay(1000);
+    if (camera_init() != ESP_OK) {
+        Serial.println("Cam init failed");
+        while(1) delay(1000);
+    }
 }
 
 void loop()
 {
     camera_capture_and_display();
-    // 必要ならフレームレート調整
-    // delay(30);
 }

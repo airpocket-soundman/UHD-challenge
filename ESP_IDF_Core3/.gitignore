@@ -1,0 +1,10 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+*.pyc
+.DS_Store
+
+# Dependencies
+managed_components/
+dependencies.lock
