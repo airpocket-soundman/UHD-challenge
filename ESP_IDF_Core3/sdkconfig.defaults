@@ -1,7 +1,7 @@
 # ESP32-S3 Configuration
 CONFIG_IDF_TARGET="esp32s3"
 
-# PSRAM Configuration - DISABLED
+# PSRAM Configuration - DISABLED (M5Stack CoreS3 PSRAM connection issue)
 CONFIG_SPIRAM=n
 
 # Camera Configuration
@@ -34,3 +34,10 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 
 # Compiler options
 CONFIG_COMPILER_OPTIMIZATION_PERF=y
+
+# I2C Driver Configuration - Use new driver (driver_ng) only
+CONFIG_I2C_ENABLE_LEGACY=n
+
+# LVGL Image Decoder Configuration
+CONFIG_LV_USE_TJPGD=y
+CONFIG_LV_USE_LIBJPEG_TURBO=n

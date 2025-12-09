@@ -1,6 +1,6 @@
 ## IDF Component Manager Manifest File
 dependencies:
-  espressif/esp32-camera: "^2.0.14"
+  espressif/m5stack_core_s3: "^1.1.0"
   espressif/esp-dl: "*"
   
   ## Required IDF version
