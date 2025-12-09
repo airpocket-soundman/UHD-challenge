@@ -9,4 +9,7 @@ idf_component_register(
         esp_timer
         nvs_flash
         fatfs
+        espressif__esp-dl
+        espressif__esp_jpeg
+        espressif__m5stack_core_s3
 )

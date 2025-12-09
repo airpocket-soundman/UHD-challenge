@@ -163,7 +163,7 @@ std::vector<Detection> decode_utod(
 
 
 // ------------------------------------------------------
-// Resize RGB565 → RGB888
+// Resize RGB565 -> RGB888
 // ------------------------------------------------------
 void resize_rgb565_to_rgb888(uint16_t* src,int sw,int sh,
                              uint8_t* dst,int dw,int dh){
@@ -190,7 +190,7 @@ void resize_rgb565_to_rgb888(uint16_t* src,int sw,int sh,
 
 
 // ------------------------------------------------------
-// Normalize (HWC→CHW float)
+// Normalize (HWC -> CHW float)
 // ------------------------------------------------------
 void normalize_rgb888_to_float(uint8_t* src,float* dst,int size){
     int px = size*size;
@@ -282,21 +282,27 @@ extern "C" void app_main(void){
     int64_t t3=esp_timer_get_time();
     ESP_LOGI(TAG,"Resize+normalize = %.2fms",(t3-t2)/1000.f);
 
-    // --- copy input → ESP-DL tensor (NCHW→NHWC) ---
+    // --- copy input to ESP-DL tensor (NCHW float -> NHWC int8) ---
     TensorBase* tin=model->get_input();
     ESP_LOGI(TAG,"Input tensor shape = [%d,%d,%d,%d]",
         tin->shape[0],tin->shape[1],tin->shape[2],tin->shape[3]);
 
     {
         float* src = input; // CHW (3,64,64)
-        float* dst = (float*)tin->get_element_ptr(); // NHWC
+        int8_t* dst = (int8_t*)tin->get_element_ptr(); // NHWC int8
+        float in_scale = DL_SCALE(tin->exponent);
+        ESP_LOGI(TAG,"Input scale = %g (exp=%d)",in_scale,tin->exponent);
 
         for(int h=0; h<64; h++){
             for(int w=0; w<64; w++){
                 for(int c=0; c<3; c++){
-                    int src_index = c*64*64 + h*64 + w;
-                    int dst_index = h*64*3 + w*3 + c;
-                    dst[dst_index] = src[src_index];
+                    int src_index = c*64*64 + h*64 + w; // CHW
+                    int dst_index = h*64*3 + w*3 + c;   // NHWC
+                    float v = src[src_index];
+                    int q = (int)roundf(v / in_scale);
+                    if(q < -128) q = -128;
+                    if(q >  127) q =  127;
+                    dst[dst_index] = (int8_t)q;
                 }
             }
         }
@@ -322,9 +328,18 @@ extern "C" void app_main(void){
     ESP_LOGI(TAG,"Output shape = [%d,%d,%d,%d] scale=%g total=%d",
              N,H,W,Cc,scale,total);
 
+    // NHWC(int8) -> CHW(float) に並べ替えつつデ量子化
     std::vector<float> fmap(total);
     int8_t* qout=(int8_t*)tout->get_element_ptr();
-    for(int i=0;i<total;i++) fmap[i] = qout[i] * scale;
+    for(int h=0; h<H; h++){
+        for(int w=0; w<W; w++){
+            for(int c=0; c<Cc; c++){
+                int q_idx   = (h*W + w)*Cc + c; // NHWC
+                int dst_idx = (c*H + h)*W + w;  // CHW
+                fmap[dst_idx] = qout[q_idx] * scale;
+            }
+        }
+    }
 
     auto raw = decode_utod(MC, fmap.data(), Cc, H, W, 0.25f);
     auto det = apply_nms(raw, 0.5f);
