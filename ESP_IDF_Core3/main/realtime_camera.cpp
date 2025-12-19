@@ -7,7 +7,6 @@
 #include "esp_camera.h"
 #include "img_converters.h"
 #include "LovyanGFX.hpp"
-#include "driver/i2c.h"
 
 static const char *TAG = "CAM_LGFX";
 
@@ -85,37 +84,6 @@ static camera_config_t camera_cfg = {
     .sccb_i2c_port= -1,
 };
 
-// Enable power rails for LCD/CAM via AW9523 on I2C port 1 (pins 12/11)
-static void ensure_camera_power(void)
-{
-    i2c_config_t conf = {
-        .mode = I2C_MODE_MASTER,
-        .sda_io_num = GPIO_NUM_12,
-        .scl_io_num = GPIO_NUM_11,
-        .sda_pullup_en = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        .master = {.clk_speed = 400000},
-        .clk_flags = 0,
-    };
-    i2c_param_config(I2C_NUM_1, &conf);
-    i2c_driver_install(I2C_NUM_1, conf.mode, 0, 0, 0);
-
-    uint8_t data[2];
-    esp_err_t err;
-    data[0] = 0x02; data[1] = 0x02; // P0 minimal
-    err = i2c_master_write_to_device(I2C_NUM_1, 0x58, data, sizeof(data), 1000 / portTICK_PERIOD_MS);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "AW9523 P0 write failed: %s", esp_err_to_name(err));
-    }
-    data[0] = 0x03; data[1] = 0xA3; // enable LCD + CAM
-    err = i2c_master_write_to_device(I2C_NUM_1, 0x58, data, sizeof(data), 1000 / portTICK_PERIOD_MS);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "AW9523 P1 write failed: %s", esp_err_to_name(err));
-    }
-
-    i2c_driver_delete(I2C_NUM_1); // release before esp_camera uses same port
-}
-
 extern "C" void app_main(void)
 {
     ESP_LOGI(TAG, "Start camera preview with LovyanGFX (YUV->RGB)");
@@ -123,8 +91,6 @@ extern "C" void app_main(void)
     lcd.init();
     lcd.setRotation(1);
     lcd.fillScreen(TFT_BLACK);
-
-    ensure_camera_power();
 
     esp_err_t err = esp_camera_init(&camera_cfg);
     if (err != ESP_OK) {
